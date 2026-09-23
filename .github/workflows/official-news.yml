@@ -2,19 +2,17 @@
 name: Gabu Official News
 
 on:
-  on:
-  workflow_dispatch:
-
   workflow_dispatch:
     inputs:
       test_notification:
-        description: Send a test message to Discord
+        description: "Send a test message to Discord"
         type: boolean
         default: false
+
       dry_run:
-        description: Print previews without posting to Discord
+        description: "Print previews without posting to Discord"
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write
@@ -26,33 +24,44 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install free dependencies
-        run: python -m pip install 'requests>=2.31,<3' 'beautifulsoup4>=4.12,<5'
+        run: |
+          python -m pip install "requests>=2.31,<3" "beautifulsoup4>=4.12,<5"
 
       - name: Check official announcements
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TEST_NOTIFICATION: ${{ inputs.test_notification || 'false' }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
-        run: python scripts/official_news.py
+        run: |
+          python scripts/official_news.py
 
       - name: Save announcement state
         if: ${{ !inputs.dry_run && !inputs.test_notification }}
         run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add official_news_state.json
-          if ! git diff --cached --quiet; then
-            git commit -m 'Update Gabu official news state'
-            git pull --rebase
-            git push
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -f official_news_state.json ]; then
+            git add official_news_state.json
+
+            if ! git diff --cached --quiet; then
+              git commit -m "Update Gabu official news state"
+              git pull --rebase
+              git push
+            else
+              echo "No state changes"
+            fi
           fi
