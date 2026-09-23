@@ -13,16 +13,17 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Send latest HKfuntown video to Discord
+      - name: Preview latest YouTube video
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           python - <<'PY'
           import json
           import os
+          import sys
           import urllib.request
+          import urllib.error
           import xml.etree.ElementTree as ET
-          from datetime import datetime
 
           CHANNEL_ID = "UCRG7LdWB_-_fP7VF7nCPjcg"
           RSS_URL = (
@@ -30,27 +31,63 @@ jobs:
               f"?channel_id={CHANNEL_ID}"
           )
 
-          webhook = os.environ.get(
+          WEBHOOK = os.environ.get(
               "DISCORD_WEBHOOK_URL", ""
           ).strip()
 
-          if not webhook:
-              raise RuntimeError(
-                  "Missing DISCORD_WEBHOOK_URL"
+          def request(url, data=None):
+              headers = {
+                  "User-Agent": "Mozilla/5.0",
+              }
+
+              if data is not None:
+                  headers["Content-Type"] = (
+                      "application/json"
+                  )
+
+              req = urllib.request.Request(
+                  url,
+                  data=data,
+                  headers=headers,
+                  method="POST" if data else "GET",
               )
 
-          # 讀取 YouTube 官方 RSS。
-          request = urllib.request.Request(
-              RSS_URL,
-              headers={
-                  "User-Agent": "Mozilla/5.0"
-              },
+              try:
+                  with urllib.request.urlopen(
+                      req, timeout=30
+                  ) as response:
+                      return response.read()
+
+              except urllib.error.HTTPError as exc:
+                  # 不輸出 Webhook URL 或密鑰。
+                  raise RuntimeError(
+                      f"HTTP {exc.code} "
+                      f"{exc.reason}"
+                  ) from None
+
+          print(
+              "STEP 1: Reading YouTube RSS",
+              flush=True
           )
 
-          with urllib.request.urlopen(
-              request, timeout=30
-          ) as response:
-              xml_data = response.read()
+          try:
+              xml_data = request(RSS_URL)
+              print(
+                  "STEP 1 SUCCESS",
+                  flush=True
+              )
+          except Exception as exc:
+              print(
+                  "STEP 1 FAILED:",
+                  exc,
+                  flush=True
+              )
+              sys.exit(1)
+
+          print(
+              "STEP 2: Finding latest video",
+              flush=True
+          )
 
           root = ET.fromstring(xml_data)
 
@@ -59,7 +96,8 @@ jobs:
                   "http://www.w3.org/2005/Atom"
               ),
               "yt": (
-                  "http://www.youtube.com/xml/schemas/2015"
+                  "http://www.youtube.com/xml/"
+                  "schemas/2015"
               ),
           }
 
@@ -69,11 +107,18 @@ jobs:
 
           if not entries:
               raise RuntimeError(
-                  "YouTube RSS has no videos"
+                  "YouTube RSS contains no videos"
               )
 
-          # RSS 第一筆通常是最新影片。
-          latest = entries[0]
+          # 以發布時間排序。
+          latest = max(
+              entries,
+              key=lambda entry: entry.findtext(
+                  "atom:published",
+                  default="",
+                  namespaces=ns,
+              ),
+          )
 
           title = latest.findtext(
               "atom:title",
@@ -95,7 +140,7 @@ jobs:
 
           if not video_id:
               raise RuntimeError(
-                  "Missing YouTube video ID"
+                  "Missing video ID"
               )
 
           video_url = (
@@ -103,14 +148,25 @@ jobs:
               + video_id
           )
 
-          date_text = published[:10]
+          print(
+              "STEP 2 SUCCESS:",
+              title,
+              published,
+              flush=True
+          )
+
+          if not WEBHOOK:
+              raise RuntimeError(
+                  "Missing DISCORD_WEBHOOK_URL"
+              )
 
           payload = {
               "username": "加布",
               "content": (
                   "🧪 **YouTube 最新影片預覽**\n"
-                  "🎬 **" + title + "**\n"
-                  "📅 發布日期：" + date_text + "\n\n"
+                  f"🎬 **{title}**\n"
+                  f"📅 發布日期：{published[:10]}"
+                  "\n\n"
                   + video_url
               ),
               "allowed_mentions": {
@@ -123,27 +179,24 @@ jobs:
               ensure_ascii=False,
           ).encode("utf-8")
 
-          post = urllib.request.Request(
-              webhook,
-              data=data,
-              headers={
-                  "Content-Type": "application/json"
-              },
-              method="POST",
+          print(
+              "STEP 3: Sending to Discord",
+              flush=True
           )
 
-          with urllib.request.urlopen(
-              post, timeout=30
-          ) as response:
+          try:
+              request(WEBHOOK, data=data)
               print(
-                  "Discord HTTP:",
-                  response.status
+                  "STEP 3 SUCCESS: "
+                  "Discord preview sent",
+                  flush=True
               )
 
-          print("Latest video:", title)
-          print("Published:", published)
-          print("Video:", video_url)
-          print(
-              "YouTube preview sent successfully"
-          )
+          except Exception as exc:
+              print(
+                  "STEP 3 FAILED:",
+                  exc,
+                  flush=True
+              )
+              sys.exit(1)
           PY
