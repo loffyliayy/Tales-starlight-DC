@@ -3,7 +3,6 @@ name: Gabu Official News
 
 on:
   schedule:
-    # 每 20 分鐘檢查一次（UTC）
     - cron: "7,27,47 * * * *"
 
   workflow_dispatch:
@@ -17,6 +16,11 @@ on:
         description: "Print previews without posting to Discord"
         type: boolean
         default: true
+
+      preview_latest:
+        description: "Send latest 3 official notices to Discord"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -47,7 +51,63 @@ jobs:
             "requests>=2.31,<3" \
             "beautifulsoup4>=4.12,<5"
 
+      - name: Preview latest notices in Discord
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.preview_latest }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DRY_RUN: "false"
+          TEST_NOTIFICATION: "false"
+        run: |
+          python - <<'PY'
+          import sys
+          import time
+
+          sys.path.insert(0, "scripts")
+          import official_news as news
+
+          # 三類公告各取最新一則。
+          for category in ("event", "patch", "news"):
+              print("PREVIEW CATEGORY:", category)
+
+              soup = news.fetch(
+                  news.SOURCES[category]
+              )
+
+              if category == "event":
+                  items = news.parse_events(soup)
+              else:
+                  items = news.split_announcements(
+                      soup, category
+                  )
+
+              if not items:
+                  raise RuntimeError(
+                      f"No {category} notices found"
+                  )
+
+              # 按公告日期選取最新一則。
+              latest = max(
+                  items,
+                  key=lambda item: item["date"]
+              )
+
+              if category == "event":
+                  latest = news.enrich_event(latest)
+
+              print(
+                  "SENDING:",
+                  latest["date"],
+                  latest["title"]
+              )
+
+              news.notify(latest)
+              time.sleep(2)
+
+          print("Latest notices preview completed")
+          PY
+
       - name: Check official announcements
+        if: ${{ !inputs.preview_latest }}
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TEST_NOTIFICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.test_notification && 'true' || 'false' }}
@@ -56,7 +116,7 @@ jobs:
           python scripts/official_news.py
 
       - name: Save announcement state
-        if: ${{ always() && (github.event_name == 'schedule' || (!inputs.dry_run && !inputs.test_notification)) }}
+        if: ${{ always() && !inputs.preview_latest && (github.event_name == 'schedule' || (!inputs.dry_run && !inputs.test_notification)) }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
