@@ -1,5 +1,19 @@
 
-"""TalesRunner official news -> Discord. No paid API. Python 3.11+."""
+"""
+加布 2.0：跑 Online 官方公告監測
+
+功能：
+- 活動公告
+- 更新預告
+- 系統公告
+- Discord Embed 超連結
+- 活動圖片
+- 首次執行不發送歷史公告
+- 防止重複通知
+- dry_run 測試模式
+
+不需要付費 AI API。
+"""
 
 import hashlib
 import json
@@ -13,357 +27,727 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+
+# =====================================
+# 基本設定
+# =====================================
+
 BASE = "https://www.talesrunner.com.hk"
 
 SOURCES = {
-    "event": f"{BASE}/notice/notice.php?type=event",
-    "patch": f"{BASE}/notice/notice.php?type=patch",
-    "news": f"{BASE}/notice/notice.php",
+    "event": BASE + "/notice/notice.php?type=event",
+    "patch": BASE + "/notice/notice.php?type=patch",
+    "news": BASE + "/notice/notice.php",
 }
 
-STATE = Path("official_news_state.json")
+STATE_FILE = Path("official_news_state.json")
 
-WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-DRY_RUN = os.environ.get("DRY_RUN", "").lower() == "true"
-TEST = os.environ.get("TEST_NOTIFICATION", "").lower() == "true"
+WEBHOOK = os.environ.get(
+    "DISCORD_WEBHOOK_URL", ""
+).strip()
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; GabuGuildNews/2.0)"
-}
+DRY_RUN = (
+    os.environ.get("DRY_RUN", "false").lower()
+    == "true"
+)
 
-DATE = re.compile(r"20\d\d\s*[/.-]\s*\d{1,2}\s*[/.-]\s*\d{1,2}")
+TEST = (
+    os.environ.get(
+        "TEST_NOTIFICATION", "false"
+    ).lower()
+    == "true"
+)
 
 SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(compatible; GabuGuildNews/2.0)"
+    )
+})
+
+DATE_RE = re.compile(
+    r"20\d{2}\s*[/.-]\s*"
+    r"\d{1,2}\s*[/.-]\s*\d{1,2}"
+)
+
+COLORS = {
+    "event": 0xA855F7,
+    "patch": 0x4786ED,
+    "news": 0xE8A23C,
+}
+
+LABELS = {
+    "event": "🎉 活動公告",
+    "patch": "🎬 更新預告",
+    "news": "📢 系統公告",
+}
 
 
-def clean(s):
-    return re.sub(r"\s+", " ", s or "").strip()
+# =====================================
+# 通用工具
+# =====================================
+
+def clean(value):
+    return re.sub(
+        r"\s+", " ", value or ""
+    ).strip()
 
 
-def get(url):
-    response = SESSION.get(url, timeout=35)
+def normalize_date(value):
+    value = re.sub(
+        r"\s+", "", value
+    )
+
+    return (
+        value.replace("-", "/")
+        .replace(".", "/")
+    )
+
+
+def shorten(value, limit=900):
+    if len(value) <= limit:
+        return value
+
+    return value[:limit - 1] + "…"
+
+
+def absolute_url(value):
+    if not value:
+        return ""
+
+    url = urljoin(BASE, value)
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        return ""
+
+    if parsed.hostname not in (
+        "www.talesrunner.com.hk",
+        "talesrunner.com.hk",
+    ):
+        return ""
+
+    return url
+
+
+def fetch(url):
+    response = SESSION.get(
+        url,
+        timeout=35
+    )
+
     response.raise_for_status()
-    response.encoding = response.apparent_encoding or response.encoding
-    return BeautifulSoup(response.text, "html.parser")
+
+    if response.apparent_encoding:
+        response.encoding = (
+            response.apparent_encoding
+        )
+
+    return BeautifulSoup(
+        response.text,
+        "html.parser"
+    )
 
 
-def absolute(href):
-    url = urljoin(BASE, href or "")
-    allowed = {"www.talesrunner.com.hk", "talesrunner.com.hk"}
-    return url if urlparse(url).hostname in allowed else ""
+def make_key(category, date, title):
+    raw = f"{category}|{date}|{title}"
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()[:20]
 
 
-def item_container(date_node):
-    """Find the smallest useful announcement wrapper near a date."""
+def make_digest(item):
+    raw = json.dumps(
+        {
+            "title": item["title"],
+            "body": item["body"],
+            "images": item["images"],
+        },
+        ensure_ascii=False,
+        sort_keys=True
+    )
 
-    for p in [date_node, *list(date_node.parents)[:7]]:
-        if not getattr(p, "get_text", None):
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()[:16]
+
+
+# =====================================
+# 尋找公告連結
+# =====================================
+
+def find_detail_url(container, title, category):
+    """
+    優先尋找公告本身的連結。
+    不把列表頁誤當成獨立公告網址。
+    """
+
+    anchors = container.find_all(
+        "a",
+        href=True
+    )
+
+    title_short = clean(title)[:8]
+
+    candidates = []
+
+    for anchor in anchors:
+        url = absolute_url(
+            anchor.get("href")
+        )
+
+        if not url:
             continue
 
-        text = clean(p.get_text(" ", strip=True))
-        dates = DATE.findall(text)
+        if url == SOURCES[category]:
+            continue
+
+        anchor_text = clean(
+            anchor.get_text(" ", strip=True)
+        )
+
+        score = 0
 
         if (
-            len(dates) == 1
-            and 12 <= len(text) <= 9000
-            and (p.find("a") or p.find("img"))
+            title_short
+            and title_short in anchor_text
         ):
-            return p
+            score += 10
 
-    return date_node.parent
+        if "notice" in url.lower():
+            score += 2
 
+        if "news" in url.lower():
+            score += 1
+
+        candidates.append(
+            (score, url)
+        )
+
+    if not candidates:
+        return ""
+
+    candidates.sort(
+        key=lambda item: item[0],
+        reverse=True
+    )
+
+    return candidates[0][1]
+
+
+# =====================================
+# 解析單則公告
+# =====================================
+
+def build_item(
+    container,
+    category,
+    date,
+    title,
+    url=""
+):
+    title = clean(title)
+
+    if not title:
+        return None
+
+    if len(title) > 180:
+        return None
+
+    if DATE_RE.fullmatch(title):
+        return None
+
+    if not url:
+        url = find_detail_url(
+            container,
+            title,
+            category
+        )
+
+    # 讀取公告區塊內的文字
+    lines = [
+        clean(line)
+        for line in container.get_text(
+            "\n",
+            strip=True
+        ).splitlines()
+    ]
+
+    lines = [
+        line
+        for line in lines
+        if line
+    ]
+
+    # 去除日期及標題
+    body_lines = []
+
+    title_found = False
+
+    for line in lines:
+        if not title_found:
+            if title in line:
+                title_found = True
+
+            continue
+
+        if DATE_RE.fullmatch(line):
+            break
+
+        body_lines.append(line)
+
+    body = "\n".join(body_lines)
+
+    # 活動圖片
+    images = []
+
+    if category == "event":
+        for img in container.find_all("img"):
+            src = absolute_url(
+                img.get("data-src")
+                or img.get("src")
+            )
+
+            if not src:
+                continue
+
+            lower = src.lower()
+
+            if any(
+                word in lower
+                for word in (
+                    "logo",
+                    "icon",
+                    "button",
+                    "btn_",
+                    "bullet",
+                )
+            ):
+                continue
+
+            if src not in images:
+                images.append(src)
+
+    return {
+        "key": make_key(
+            category,
+            date,
+            title
+        ),
+        "category": category,
+        "date": date,
+        "title": title,
+        "url": url,
+        "body": body,
+        "images": images[:4],
+    }
+
+
+# =====================================
+# 解析公告列表
+# =====================================
 
 def parse_items(soup, category):
-    for tag in soup(["script", "style", "nav", "footer", "header"]):
+    """
+    先尋找包含日期的獨立公告區塊。
+
+    若網站的 HTML 沒有明確區塊，
+    則使用日期分段作為後備方法。
+    """
+
+    for tag in soup(
+        ["script", "style", "nav", "footer"]
+    ):
         tag.decompose()
 
     items = []
     seen = set()
 
-    for node in soup.find_all(string=DATE):
-        raw = clean(str(node))
-        match = DATE.search(raw)
+    # 方法一：尋找每個公告的獨立容器
+    for node in soup.find_all(
+        string=DATE_RE
+    ):
+        match = DATE_RE.search(
+            str(node)
+        )
 
         if not match:
             continue
 
-        date = (
-            re.sub(r"\s+", "", match.group())
-            .replace(".", "/")
-            .replace("-", "/")
+        date = normalize_date(
+            match.group()
         )
 
-        container = item_container(node)
+        container = None
+
+        for parent in [
+            node.parent,
+            *list(node.parents)[:7]
+        ]:
+            if not getattr(
+                parent,
+                "get_text",
+                None
+            ):
+                continue
+
+            text = clean(
+                parent.get_text(
+                    " ",
+                    strip=True
+                )
+            )
+
+            dates = DATE_RE.findall(text)
+
+            # 避免選到包含整頁公告的大容器
+            if len(dates) != 1:
+                continue
+
+            if not (
+                12 <= len(text) <= 9000
+            ):
+                continue
+
+            if not parent.find("a"):
+                continue
+
+            container = parent
+            break
 
         if container is None:
             continue
 
         lines = [
-            clean(x)
-            for x in container.get_text("\n", strip=True).splitlines()
+            clean(line)
+            for line in container.get_text(
+                "\n",
+                strip=True
+            ).splitlines()
         ]
 
         lines = [
-            x for x in lines
-            if x and x not in {"◆", "|"}
+            line for line in lines
+            if line and line not in (
+                "◆", "|", "Image"
+            )
         ]
 
-        date_positions = [
-            i for i, line in enumerate(lines)
-            if DATE.search(line)
-        ]
+        date_index = next(
+            (
+                i
+                for i, line in enumerate(lines)
+                if DATE_RE.search(line)
+            ),
+            -1
+        )
 
-        if len(date_positions) != 1:
+        if date_index < 0:
             continue
 
-        content = [
-            x for x in lines[date_positions[0] + 1:]
-            if x not in {"Image", "◆"}
+        title_candidates = [
+            line.lstrip("|").strip()
+            for line in lines[
+                date_index + 1:
+            ]
         ]
 
-        if not content:
+        title_candidates = [
+            line
+            for line in title_candidates
+            if line
+            and not DATE_RE.fullmatch(line)
+        ]
+
+        if not title_candidates:
             continue
 
-        title = clean(content[0]).lstrip("|").strip()
+        title = title_candidates[0]
 
-        if (
-            not title
-            or len(title) > 180
-            or DATE.fullmatch(title)
+        item = build_item(
+            container,
+            category,
+            date,
+            title
+        )
+
+        if not item:
+            continue
+
+        if item["key"] in seen:
+            continue
+
+        seen.add(item["key"])
+        items.append(item)
+
+    # 方法二：按日期分段，補充未成功解析的公告
+    #
+    # 只把有獨立連結的區塊加入結果，
+    # 避免整頁文字被誤認為一則公告。
+
+    for anchor in soup.find_all(
+        "a",
+        href=True
+    ):
+        url = absolute_url(
+            anchor.get("href")
+        )
+
+        if not url:
+            continue
+
+        if url == SOURCES[category]:
+            continue
+
+        title = clean(
+            anchor.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        if not (
+            4 <= len(title) <= 180
         ):
             continue
 
-        anchors = container.find_all("a", href=True)
+        container = None
+        date = ""
 
-        best = next(
-            (
-                a for a in anchors
-                if title[:8] in clean(a.get_text(" ", strip=True))
-            ),
-            None
-        )
-
-        if best is None:
-            best = next(
-                (
-                    a for a in anchors
-                    if "notice" in a["href"]
-                    or "event" in a["href"]
-                ),
+        for parent in [
+            anchor.parent,
+            *list(anchor.parents)[:6]
+        ]:
+            if not getattr(
+                parent,
+                "get_text",
                 None
+            ):
+                continue
+
+            text = clean(
+                parent.get_text(
+                    " ",
+                    strip=True
+                )
             )
 
-        url = absolute(best["href"]) if best else ""
+            dates = DATE_RE.findall(text)
 
-        if not url or url == SOURCES[category]:
-            url = SOURCES[category]
+            if len(dates) == 1:
+                container = parent
+                date = normalize_date(
+                    dates[0]
+                )
+                break
 
-        images = []
-
-        for img in container.find_all("img"):
-            src = absolute(img.get("data-src") or img.get("src"))
-
-            if src and not any(
-                k in src.lower()
-                for k in ("logo", "icon", "bullet", "btn_", "button")
-            ):
-                if src not in images:
-                    images.append(src)
-
-        body = "\n".join(content[1:])
-
-        key = hashlib.sha256(
-            f"{category}|{date}|{title}".encode()
-        ).hexdigest()[:20]
-
-        if key in seen:
+        if container is None:
             continue
 
-        seen.add(key)
+        item = build_item(
+            container,
+            category,
+            date,
+            title,
+            url
+        )
 
-        items.append({
-            "key": key,
-            "category": category,
-            "date": date,
-            "title": title,
-            "url": url,
-            "body": body,
-            "images": images[:4],
-        })
+        if not item:
+            continue
+
+        if item["key"] in seen:
+            continue
+
+        seen.add(item["key"])
+        items.append(item)
 
     return items
 
 
-def digest(item):
-    source = (
-        item["title"]
-        + item["body"]
-        + "|".join(item["images"])
-    )
+# =====================================
+# 取得獨立公告的正文及圖片
+# =====================================
 
-    return hashlib.sha256(
-        source.encode()
-    ).hexdigest()[:16]
+def enrich_item(item):
+    """
+    只有找到獨立公告網址才讀取詳情。
+    若詳情頁無法讀取，保留列表資料。
+    """
+
+    url = item["url"]
+
+    if not url:
+        return item
+
+    if url == SOURCES[item["category"]]:
+        return item
+
+    try:
+        soup = fetch(url)
+
+        for tag in soup(
+            ["script", "style", "nav", "footer"]
+        ):
+            tag.decompose()
+
+        candidates = []
+
+        for selector in (
+            ".notice_view",
+            ".view_content",
+            ".view_cont",
+            ".board_view",
+            ".content",
+            "article",
+        ):
+            candidates.extend(
+                soup.select(selector)
+            )
+
+        if not candidates:
+            candidates = [
+                soup.body or soup
+            ]
+
+        content = max(
+            candidates,
+            key=lambda element: len(
+                element.get_text(
+                    " ",
+                    strip=True
+                )
+            )
+        )
+
+        text = content.get_text(
+            "\n",
+            strip=True
+        )
+
+        if text:
+            item["body"] = text
+
+        if item["category"] == "event":
+            images = []
+
+            for img in content.find_all("img"):
+                src = absolute_url(
+                    img.get("data-src")
+                    or img.get("src")
+                )
+
+                if not src:
+                    continue
+
+                if any(
+                    word in src.lower()
+                    for word in (
+                        "logo",
+                        "icon",
+                        "button",
+                        "btn_",
+                    )
+                ):
+                    continue
+
+                if src not in images:
+                    images.append(src)
+
+            if images:
+                item["images"] = images[:4]
+
+    except requests.RequestException as exc:
+        print(
+            "Detail page unavailable:",
+            item["title"],
+            type(exc).__name__
+        )
+
+    return item
 
 
-def lines_from_section(body, start, end, max_items):
-    if not body:
-        return []
+# =====================================
+# Discord 訊息格式
+# =====================================
 
-    match = re.search(start, body, flags=re.I)
-
-    if not match:
-        return []
-
-    text = body[match.end():]
-    stop = re.search(end, text, flags=re.I) if end else None
-
-    if stop:
-        text = text[:stop.start()]
-
-    parts = re.split(
-        r"\n|(?=\d+\s*[)）.、])",
-        text
-    )
-
-    return [
-        clean(re.sub(r"^\d+\s*[)）.、]\s*", "", x))
-        for x in parts
-        if clean(x)
-    ][:max_items]
-
-
-def shorten(s, limit=850):
-    if len(s) <= limit:
-        return s
-
-    return s[:limit - 1] + "…"
-
-
-def embed_for(item, changed=False):
+def make_embed(item, changed=False):
     category = item["category"]
 
-    label = {
-        "event": "🎉 活動公告",
-        "patch": "🎬 更新預告",
-        "news": "📢 系統公告",
-    }[category]
-
-    color = {
-        "event": 0xA855F7,
-        "patch": 0x4786ED,
-        "news": 0xE8A23C,
-    }[category]
+    prefix = (
+        "🔄 公告內容更新｜"
+        if changed
+        else ""
+    )
 
     title = (
-        "🔄 公告內容更新｜" if changed else ""
-    ) + item["title"]
+        LABELS[category]
+        + "｜"
+        + prefix
+        + item["title"]
+    )
 
-    body = item["body"]
     fields = []
 
-    if category == "patch":
-        maintenance = re.search(
-            r"維護日期及時間\s*[:：]?\s*([^\n]{1,90})",
-            body
-        )
+    body = item["body"]
 
-        if maintenance:
-            fields.append({
-                "name": "🕒 維護時間",
-                "value": shorten(
-                    clean(maintenance.group(1)),
-                    180
-                ),
-                "inline": False,
-            })
-
-        main = lines_from_section(
-            body,
-            r"本次更新主要內容\s*[:：]?",
-            r"注意事項\s*[:：]?",
-            12
-        )
-
-        notes = lines_from_section(
-            body,
-            r"注意事項\s*[:：]?",
-            None,
-            12
-        )
-
-        if main:
-            fields.append({
-                "name": "✨ 主要更新",
-                "value": shorten(
-                    "\n".join("• " + x for x in main),
-                    950
-                ),
-                "inline": False,
-            })
-
-        if notes:
-            fields.append({
-                "name": "⚠️ 注意事項／下架提醒",
-                "value": shorten(
-                    "\n".join("• " + x for x in notes),
-                    950
-                ),
-                "inline": False,
-            })
-
-    elif category == "news" and body:
-        body_lines = [
-            clean(x)
-            for x in body.splitlines()
-            if clean(x)
-        ]
-
-        body_lines = [
-            x for x in body_lines
-            if x not in (
-                "各位跑者好，",
-                "各位跑者好﹐",
-                "《跑Online》營運團隊 敬上",
-            )
-        ]
-
-        if body_lines:
-            fields.append({
-                "name": "公告重點（節錄）",
-                "value": shorten(
-                    "\n".join(body_lines[:9]),
-                    950
-                ),
-                "inline": False,
-            })
-
-    elif category == "event":
+    if category == "event":
         fields.append({
-            "name": "活動詳情",
+            "name": "📋 活動詳情",
             "value": (
-                "官方公告以圖片為主，"
-                "請查看下方圖片及完整活動頁。"
+                "請查看官方活動圖片及"
+                "完整公告。"
             ),
             "inline": False,
         })
 
+    elif category == "patch":
+        if body:
+            fields.append({
+                "name": "✨ 官方更新內容",
+                "value": shorten(
+                    body,
+                    1000
+                ),
+                "inline": False,
+            })
+
+    elif category == "news":
+        if body:
+            fields.append({
+                "name": "📢 公告內容",
+                "value": shorten(
+                    body,
+                    1000
+                ),
+                "inline": False,
+            })
+
     embed = {
-        "title": shorten(
-            f"{label}｜{title}",
-            250
+        "title": shorten(title, 250),
+        "color": COLORS[category],
+        "description": (
+            "公告日期：" + item["date"]
         ),
-        "url": item["url"],
-        "color": color,
-        "description": f"公告日期：{item['date']}",
         "fields": fields,
         "footer": {
-            "text": "加布｜跑 Online 官方情報"
+            "text": (
+                "加布｜跑 Online 官方情報"
+            )
         },
     }
 
-    if category == "event" and item["images"]:
+    # Discord Embed 標題超連結
+    if item["url"]:
+        embed["url"] = item["url"]
+
+    if (
+        category == "event"
+        and item["images"]
+    ):
         embed["image"] = {
             "url": item["images"][0]
         }
@@ -371,20 +755,20 @@ def embed_for(item, changed=False):
     return embed
 
 
-def send(payload):
+def send_discord(payload):
     if DRY_RUN:
         print(
-            "DRY RUN payload:",
+            "DRY RUN:",
             json.dumps(
                 payload,
                 ensure_ascii=False
-            )[:2200]
+            )[:2500]
         )
         return
 
     if not WEBHOOK:
         raise RuntimeError(
-            "Missing DISCORD_WEBHOOK_URL GitHub secret"
+            "Missing DISCORD_WEBHOOK_URL"
         )
 
     response = SESSION.post(
@@ -395,11 +779,14 @@ def send(payload):
 
     if not response.ok:
         raise RuntimeError(
-            f"Discord HTTP {response.status_code}; "
-            "check webhook permissions or IP filtering"
+            "Discord HTTP "
+            + str(response.status_code)
         )
 
-    print("Discord sent:", response.status_code)
+    print(
+        "Discord sent:",
+        response.status_code
+    )
 
 
 def notify(item, changed=False):
@@ -409,135 +796,212 @@ def notify(item, changed=False):
             "parse": []
         },
         "embeds": [
-            embed_for(item, changed)
+            make_embed(
+                item,
+                changed
+            )
         ],
     }
 
+    # 多張活動圖片
     if (
         item["category"] == "event"
         and len(item["images"]) > 1
     ):
-        payload["embeds"].extend(
-            {
-                "url": item["url"],
-                "image": {"url": url},
-                "color": 0xA855F7,
-            }
-            for url in item["images"][1:4]
+        for url in item["images"][1:4]:
+            payload["embeds"].append({
+                "color": COLORS["event"],
+                "image": {
+                    "url": url
+                }
+            })
+
+    send_discord(payload)
+
+
+# =====================================
+# 公告紀錄
+# =====================================
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {}
+
+    return json.loads(
+        STATE_FILE.read_text(
+            encoding="utf-8"
         )
+    )
 
-    send(payload)
 
+def save_state(state):
+    if DRY_RUN:
+        return
+
+    STATE_FILE.write_text(
+        json.dumps(
+            state,
+            ensure_ascii=False,
+            indent=2
+        ) + "\n",
+        encoding="utf-8"
+    )
+
+
+# =====================================
+# 主程式
+# =====================================
 
 def main():
     if TEST:
-        send({
+        send_discord({
             "username": "加布",
-            "content": "🧪 加布 2.0 官方公告通知測試成功！",
+            "content": (
+                "🧪 加布 2.0 "
+                "官方公告通知測試成功！"
+            ),
             "allowed_mentions": {
                 "parse": []
             },
         })
         return
 
-    old = (
-        json.loads(
-            STATE.read_text(encoding="utf-8")
-        )
-        if STATE.exists()
-        else {}
-    )
+    old = load_state()
+    state = dict(old)
 
-    fresh = dict(old)
     errors = []
 
     for category, url in SOURCES.items():
+        print()
+        print(
+            "==========",
+            category,
+            "=========="
+        )
+
         try:
-            soup = get(url)
-            items = parse_items(soup, category)
+            soup = fetch(url)
+
+            items = parse_items(
+                soup,
+                category
+            )
 
             print(
-                f"{category}: parsed {len(items)} entries"
+                category,
+                ": parsed",
+                len(items),
+                "entries"
             )
 
             if not items:
                 raise RuntimeError(
-                    "No entries parsed: "
-                    "website markup may have changed; "
-                    "no state overwritten"
+                    "No announcements parsed"
                 )
+
+            # 測試時顯示前 5 筆公告，
+            # 方便檢查是否抓對標題及網址。
+            for item in items[:5]:
+                print(
+                    "PREVIEW:",
+                    item["date"],
+                    "|",
+                    item["title"]
+                )
+
+                print(
+                    "URL:",
+                    item["url"] or (
+                        "NO DETAIL URL"
+                    )
+                )
+
+            # dry_run 只檢查解析結果。
+            # 不下載全部詳情，也不發通知。
+            if DRY_RUN:
+                continue
 
             prefix = category + ":"
 
-            # First successful run:
-            # Record existing announcements silently.
+            # 第一次成功解析某類公告：
+            # 只記錄，不發送歷史消息。
             if not any(
                 key.startswith(prefix)
                 for key in old
             ):
                 for item in items:
-                    fresh[prefix + item["key"]] = digest(item)
+                    state[
+                        prefix + item["key"]
+                    ] = make_digest(item)
+
+                save_state(state)
 
                 print(
-                    f"{category}: initialized; "
-                    "no historical notifications"
+                    category,
+                    ": initialized;"
+                    " no historical notifications"
                 )
+
                 continue
 
-            # Process oldest first.
-            # Limit notifications after a long outage.
-            pending = [
-                (
-                    item,
-                    (prefix + item["key"]) in old
-                )
-                for item in reversed(items)
-                if old.get(
-                    prefix + item["key"]
-                ) != digest(item)
-            ]
+            # 找出新公告
+            pending = []
 
+            for item in reversed(items):
+                key = prefix + item["key"]
+
+                if key not in old:
+                    pending.append(
+                        (item, False)
+                    )
+
+            # 避免一次發送大量公告
             for item, changed in pending[-8:]:
-                notify(item, changed)
+                # 正式通知前讀取獨立公告
+                item = enrich_item(item)
 
-                fresh[
-                    prefix + item["key"]
-                ] = digest(item)
-
-                STATE.write_text(
-                    json.dumps(
-                        fresh,
-                        ensure_ascii=False,
-                        indent=2
-                    ) + "\n",
-                    encoding="utf-8"
+                notify(
+                    item,
+                    changed
                 )
+
+                state[
+                    prefix + item["key"]
+                ] = make_digest(item)
+
+                save_state(state)
 
                 time.sleep(1)
 
+            print(
+                category,
+                ":",
+                len(pending),
+                "new announcements"
+            )
+
         except Exception as exc:
             print(
-                f"ERROR {category}: "
-                f"{type(exc).__name__}: {exc}"
+                "ERROR:",
+                category,
+                type(exc).__name__,
+                str(exc)
             )
-            errors.append(category)
 
-    if not DRY_RUN:
-        STATE.write_text(
-            json.dumps(
-                fresh,
-                ensure_ascii=False,
-                indent=2
-            ) + "\n",
-            encoding="utf-8"
-        )
+            errors.append(category)
 
     if errors:
         print(
-            "Some categories failed:",
+            "Failed categories:",
             ", ".join(errors)
         )
+
         sys.exit(1)
+
+    print()
+    print(
+        "Gabu official news check completed"
+    )
 
 
 if __name__ == "__main__":
