@@ -4,6 +4,7 @@ name: HKfuntown YouTube Feed
 on:
   schedule:
     - cron: "*/10 * * * *"
+
   workflow_dispatch:
     inputs:
       test_notification:
@@ -15,7 +16,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: youtube-feed
+  group: hkfuntown-youtube-feed
   cancel-in-progress: false
 
 jobs:
@@ -32,69 +33,133 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TEST_NOTIFICATION: ${{ inputs.test_notification || 'false' }}
+
         run: |
           python <<'PY'
           import os
           import json
           import urllib.request
+          import urllib.error
           import xml.etree.ElementTree as ET
 
           CHANNEL_ID = "UCRG7LdWB_-_fP7VF7nCPjcg"
+
           RSS_URL = (
               "https://www.youtube.com/feeds/videos.xml"
               f"?channel_id={CHANNEL_ID}"
           )
+
           STATE_FILE = "last_video.txt"
 
-          webhook = os.environ.get("DISCORD_WEBHOOK_URL")
+          webhook = os.environ.get(
+              "DISCORD_WEBHOOK_URL", ""
+          ).strip()
+
           if not webhook:
               raise RuntimeError(
                   "Missing DISCORD_WEBHOOK_URL secret"
               )
 
-          def send_discord(title, url, test=False):
-              description = (
-                  "Webhook 測試成功！"
-                  if test else
-                  "HKfuntown 發布新影片！"
-              )
+          # ====================================
+          # Discord notification
+          # ====================================
+
+          def send_discord(title, video_url, test=False):
+
+              if test:
+                  description = (
+                      "Webhook 測試成功！"
+                  )
+              else:
+                  description = (
+                      "HKfuntown 發布新影片！"
+                  )
 
               payload = {
                   "username": "HKfuntown Feed",
-                  "embeds": [{
-                      "title": title,
-                      "description": description,
-                      "url": url,
-                      "color": 3447003,
-                      "footer": {
-                          "text": "HKfuntown YouTube Feed"
+
+                  "embeds": [
+                      {
+                          "title": title,
+                          "description": description,
+                          "url": video_url,
+                          "color": 3447003,
+                          "footer": {
+                              "text": "HKfuntown YouTube Feed"
+                          }
                       }
-                  }]
+                  ]
               }
+
+              data = json.dumps(
+                  payload,
+                  ensure_ascii=False
+              ).encode("utf-8")
 
               request = urllib.request.Request(
                   webhook,
-                  data=json.dumps(
-                      payload,
-                      ensure_ascii=False
-                  ).encode("utf-8"),
+                  data=data,
                   headers={
-                      "Content-Type": "application/json"
+                      "Content-Type": "application/json",
+                      "User-Agent": (
+                          "HKfuntownFeed/1.0"
+                      )
                   },
                   method="POST"
               )
 
-              with urllib.request.urlopen(
-                  request, timeout=30
-              ) as response:
+              try:
+                  with urllib.request.urlopen(
+                      request,
+                      timeout=30
+                  ) as response:
+
+                      print(
+                          "Discord HTTP status:",
+                          response.status
+                      )
+
+                      print(
+                          "Discord notification sent!"
+                      )
+
+              except urllib.error.HTTPError as e:
+
                   print(
-                      "Discord status:",
-                      response.status
+                      "Discord HTTP status:",
+                      e.code
                   )
+
+                  # Do not expose the webhook URL.
+                  # Display a limited response body.
+                  error_body = e.read(
+                      2000
+                  ).decode(
+                      "utf-8",
+                      errors="replace"
+                  )
+
+                  error_body = error_body.replace(
+                      webhook,
+                      "[REDACTED WEBHOOK]"
+                  )
+
+                  print(
+                      "Discord response:",
+                      error_body
+                  )
+
+                  raise RuntimeError(
+                      f"Discord request failed: HTTP {e.code}"
+                  ) from None
+
+          # ====================================
+          # Fetch YouTube RSS
+          # ====================================
 
           print("Checking HKfuntown RSS...")
 
-          request = urllib.request.Request(
+          rss_request = urllib.request.Request(
               RSS_URL,
               headers={
                   "User-Agent": "Mozilla/5.0"
@@ -102,30 +167,38 @@ jobs:
           )
 
           with urllib.request.urlopen(
-              request, timeout=30
+              rss_request,
+              timeout=30
           ) as response:
+
               rss_data = response.read()
 
           root = ET.fromstring(rss_data)
 
-          ns = {
+          namespaces = {
               "atom": "http://www.w3.org/2005/Atom",
-              "yt": "http://www.youtube.com/xml/schemas/2015"
+              "yt": (
+                  "http://www.youtube.com/xml/"
+                  "schemas/2015"
+              )
           }
 
-          entries = root.findall("atom:entry", ns)
+          entries = root.findall(
+              "atom:entry",
+              namespaces
+          )
 
           if not entries:
               raise RuntimeError(
-                  "RSS returned no videos"
+                  "No videos found in YouTube RSS"
               )
 
-          # Sort videos by publication date
+          # Sort by publication date.
           entries.sort(
-              key=lambda e: e.findtext(
+              key=lambda entry: entry.findtext(
                   "atom:published",
                   default="",
-                  namespaces=ns
+                  namespaces=namespaces
               ),
               reverse=True
           )
@@ -133,16 +206,18 @@ jobs:
           latest = entries[0]
 
           video_id = latest.findtext(
-              "yt:videoId", namespaces=ns
+              "yt:videoId",
+              namespaces=namespaces
           )
 
           title = latest.findtext(
-              "atom:title", namespaces=ns
+              "atom:title",
+              namespaces=namespaces
           )
 
           if not video_id:
               raise RuntimeError(
-                  "RSS returned no video ID"
+                  "Video ID not found"
               )
 
           video_url = (
@@ -153,53 +228,89 @@ jobs:
           print("Latest video:", title)
           print("Video ID:", video_id)
 
-          # Optional Discord test
-          if os.environ.get(
-              "TEST_NOTIFICATION", "false"
-          ).lower() == "true":
+          # ====================================
+          # Manual Discord test
+          # ====================================
+
+          test_mode = os.environ.get(
+              "TEST_NOTIFICATION",
+              "false"
+          ).lower() == "true"
+
+          if test_mode:
+
+              print(
+                  "Sending Discord test notification..."
+              )
+
               send_discord(
                   "Discord 通知測試成功",
                   video_url,
                   test=True
               )
 
+          # ====================================
+          # Check previous video
+          # ====================================
+
           previous_id = ""
 
           if os.path.exists(STATE_FILE):
+
               with open(
                   STATE_FILE,
+                  "r",
                   encoding="utf-8"
-              ) as f:
-                  previous_id = f.read().strip()
+              ) as file:
 
-          # First run: save latest video
-          # without sending an old notification
+                  previous_id = file.read().strip()
+
+          # First run:
+          # Save current video without notification.
+
           if not previous_id:
-              print("First run: initializing state")
+
+              print(
+                  "First run: initializing video state"
+              )
 
           elif previous_id == video_id:
-              print("No new video")
+
+              print(
+                  "No new video. Nothing to send."
+              )
+
               raise SystemExit(0)
 
           else:
-              print("New video detected!")
+
+              print(
+                  "New HKfuntown video detected!"
+              )
 
               send_discord(
-                  "🎬 " + title,
+                  title,
                   video_url
               )
 
-              print("Notification sent")
+          # ====================================
+          # Save state
+          # ====================================
 
-          # Save state only after successful delivery
           with open(
               STATE_FILE,
               "w",
               encoding="utf-8"
-          ) as f:
-              f.write(video_id + "\n")
+          ) as file:
 
-          print("State updated")
+              file.write(
+                  video_id + "\n"
+              )
+
+          print(
+              "Video state updated successfully"
+          )
+
           PY
 
       - name: Save latest video state
@@ -209,9 +320,9 @@ jobs:
 
           git add last_video.txt
 
-          if ! git diff --cached --quiet; then
+          if git diff --cached --quiet; then
+            echo "No state changes"
+          else
             git commit -m "Update latest HKfuntown video"
             git push
-          else
-            echo "No state changes"
           fi
