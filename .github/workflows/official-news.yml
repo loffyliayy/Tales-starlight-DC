@@ -3,6 +3,7 @@ name: Gabu Official News
 
 on:
   schedule:
+    # 每 20 分鐘檢查一次
     - cron: "7,27,47 * * * *"
 
   workflow_dispatch:
@@ -65,9 +66,12 @@ jobs:
           sys.path.insert(0, "scripts")
           import official_news as news
 
-          # 三類公告各取最新一則。
           for category in ("event", "patch", "news"):
-              print("PREVIEW CATEGORY:", category)
+              print(
+                  "PREVIEW CATEGORY:",
+                  category,
+                  flush=True
+              )
 
               soup = news.fetch(
                   news.SOURCES[category]
@@ -77,7 +81,8 @@ jobs:
                   items = news.parse_events(soup)
               else:
                   items = news.split_announcements(
-                      soup, category
+                      soup,
+                      category
                   )
 
               if not items:
@@ -85,25 +90,30 @@ jobs:
                       f"No {category} notices found"
                   )
 
-              # 按公告日期選取最新一則。
               latest = max(
                   items,
-                  key=lambda item: item["date"]
+                  key=lambda item: tuple(
+                      int(part)
+                      for part in item["date"].split("/")
+                  )
               )
-
-              if category == "event":
-                  latest = news.enrich_event(latest)
 
               print(
                   "SENDING:",
                   latest["date"],
-                  latest["title"]
+                  latest["title"],
+                  flush=True
               )
 
+              # 加布 2.4 的 notify()
+              # 會自動下載及上傳活動圖片。
               news.notify(latest)
+
               time.sleep(2)
 
-          print("Latest notices preview completed")
+          print(
+              "Latest notices preview completed"
+          )
           PY
 
       - name: Check official announcements
