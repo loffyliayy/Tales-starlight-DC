@@ -24,6 +24,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
@@ -38,18 +39,20 @@ jobs:
 
       - name: Install free dependencies
         run: |
-          python -m pip install "requests>=2.31,<3" "beautifulsoup4>=4.12,<5"
+          python -m pip install \
+            "requests>=2.31,<3" \
+            "beautifulsoup4>=4.12,<5"
 
       - name: Check official announcements
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          TEST_NOTIFICATION: ${{ inputs.test_notification || 'false' }}
-          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          TEST_NOTIFICATION: ${{ inputs.test_notification && 'true' || 'false' }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
         run: |
           python scripts/official_news.py
 
       - name: Save announcement state
-        if: ${{ !inputs.dry_run && !inputs.test_notification }}
+        if: ${{ always() && !inputs.dry_run && !inputs.test_notification }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -64,4 +67,6 @@ jobs:
             else
               echo "No state changes"
             fi
+          else
+            echo "No state file to save"
           fi
