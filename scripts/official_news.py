@@ -1,17 +1,10 @@
 
 """
-加布 2.2 — 跑 Online 官方公告監測
+加布 2.3 — 跑 Online 官方公告監測
 
-功能：
-- 活動公告：標題、獨立連結、活動圖片
-- 更新預告：維護時間、主要更新、注意事項
-- 系統公告：正文重點節錄
-- Discord Embed 超連結
-- 防止重複通知
-- 首次啟動不發送歷史公告
-- dry_run 安全測試
-
-不需要付費 API。
+首次啟動：只建立基準，不發送歷史公告。
+日常執行：只發送新增或內容有變動的公告。
+測試模式：不發送訊息，也不修改公告紀錄。
 """
 
 import hashlib
@@ -48,23 +41,24 @@ COLORS = {
 }
 
 STATE_FILE = Path("official_news_state.json")
-STATE_VERSION = 3
+STATE_VERSION = 4
 
-DRY_RUN = os.getenv(
-    "DRY_RUN", "true"
-).lower() == "true"
+DRY_RUN = (
+    os.getenv("DRY_RUN", "true").lower() == "true"
+)
 
-TEST = os.getenv(
-    "TEST_NOTIFICATION", "false"
-).lower() == "true"
+TEST = (
+    os.getenv("TEST_NOTIFICATION", "false").lower()
+    == "true"
+)
 
 WEBHOOK = os.getenv(
     "DISCORD_WEBHOOK_URL", ""
 ).strip()
 
 DATE_RE = re.compile(
-    r"20\d{2}\s*[/.-]\s*"
-    r"\d{1,2}\s*[/.-]\s*\d{1,2}"
+    r"20\d{2}\s*[/.-]\s*\d{1,2}"
+    r"\s*[/.-]\s*\d{1,2}"
 )
 
 NUMBER_RE = re.compile(
@@ -133,7 +127,9 @@ def fetch(url):
     response.raise_for_status()
 
     if response.apparent_encoding:
-        response.encoding = response.apparent_encoding
+        response.encoding = (
+            response.apparent_encoding
+        )
 
     return BeautifulSoup(
         response.text, "html.parser"
@@ -141,28 +137,26 @@ def fetch(url):
 
 
 def item_key(category, date, title):
-    value = f"{category}|{date}|{title}"
+    raw = f"{category}|{date}|{title}"
 
     return hashlib.sha256(
-        value.encode("utf-8")
+        raw.encode("utf-8")
     ).hexdigest()[:20]
 
 
 def item_digest(item):
-    # 活動圖片只在新公告發送時讀取，
-    # 不以圖片數量變化觸發重複通知。
-    value = {
-        "title": item["title"],
-        "body": item["body"],
-        "url": item["url"],
-    }
+    raw = json.dumps(
+        {
+            "title": item["title"],
+            "body": item["body"],
+            "url": item["url"],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
     return hashlib.sha256(
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True
-        ).encode("utf-8")
+        raw.encode("utf-8")
     ).hexdigest()[:16]
 
 
@@ -247,6 +241,8 @@ def parse_events(soup):
 
 
 def enrich_event(item):
+    """只在準備發送活動時讀取活動圖片。"""
+
     try:
         soup = fetch(item["url"])
 
@@ -281,8 +277,11 @@ def enrich_event(item):
             if any(
                 word in src.lower()
                 for word in (
-                    "logo", "icon", "button",
-                    "btn_", "bullet"
+                    "logo",
+                    "icon",
+                    "button",
+                    "btn_",
+                    "bullet",
                 )
             ):
                 continue
@@ -292,10 +291,9 @@ def enrich_event(item):
 
         item["images"] = images[:4]
 
-    except requests.RequestException as exc:
+    except requests.RequestException:
         print(
-            "Event images unavailable:",
-            type(exc).__name__
+            "WARNING: Could not load event images"
         )
 
     return item
@@ -306,7 +304,6 @@ def enrich_event(item):
 # =====================================
 
 def extract_lines(soup):
-    # 只移除非正文元素。
     copy = BeautifulSoup(
         str(soup), "html.parser"
     )
@@ -327,17 +324,14 @@ def extract_lines(soup):
 
 def split_announcements(soup, category):
     """
-    實際官網格式：
+    官網公告結構：
 
     ◆
     2026/09/15
     |
     09.16更新預告
-    維護日期及時間...
-    ...
+    正文...
     ◆
-
-    跳過日期與標題之間的 |。
     """
 
     lines = extract_lines(soup)
@@ -363,9 +357,6 @@ def split_announcements(soup, category):
     seen = set()
 
     for block in blocks:
-        if not block:
-            continue
-
         date_index = -1
 
         for index, line in enumerate(block[:3]):
@@ -382,8 +373,6 @@ def split_announcements(soup, category):
 
         remaining = block[date_index + 1:]
 
-        # 關鍵修正：
-        # 官網日期與標題之間有獨立的 |。
         while remaining and remaining[0] in (
             "|", "｜", "-"
         ):
@@ -399,24 +388,23 @@ def split_announcements(soup, category):
         if not 3 <= len(title) <= 180:
             continue
 
-        body_lines = remaining[1:]
-
-        # 排除空白及頁面導航。
         body_lines = [
-            line for line in body_lines
+            line
+            for line in remaining[1:]
             if line not in (
-                "上一頁", "下一頁",
-                "頁數：", "◆", "|"
+                "上一頁",
+                "下一頁",
+                "頁數：",
+                "◆",
+                "|",
             )
         ]
-
-        body = "\n".join(body_lines)
 
         item = make_item(
             category,
             date,
             title,
-            body=body
+            body="\n".join(body_lines),
         )
 
         if item["key"] in seen:
@@ -429,23 +417,10 @@ def split_announcements(soup, category):
 
 
 # =====================================
-# 將被 HTML 拆開的提醒合併
+# 更新預告內容整理
 # =====================================
 
 def combine_numbered_lines(lines):
-    """
-    例如：
-
-    1 )
-    「
-    DashJump
-    」活動將於9月16日維護時完結
-
-    合併成：
-
-    1) 「DashJump」活動將於...
-    """
-
     result = []
     current = ""
 
@@ -455,31 +430,23 @@ def combine_numbered_lines(lines):
         if not line or line == "-":
             continue
 
-        numbered = bool(
-            NUMBER_RE.match(line)
-        )
-
-        if numbered:
+        if NUMBER_RE.match(line):
             if current:
                 result.append(current)
 
             current = re.sub(
                 r"^(\d+)\s*[)）.、]\s*",
                 r"\1) ",
-                line
+                line,
             )
 
         elif current:
-            # HTML 將引號及物品名稱拆成數行。
-            # 直接接回前一段，避免產生
-            # 沒有意義的獨立項目。
-            if line.startswith((
-                "「", "」", "『", "』"
-            )):
-                current += line
-            elif current.endswith((
-                "「", "」", "『", "』"
-            )):
+            if (
+                line.startswith(("「", "」", "『", "』"))
+                or current.endswith(
+                    ("「", "」", "『", "』")
+                )
+            ):
                 current += line
             else:
                 current += " " + line
@@ -495,9 +462,9 @@ def combine_numbered_lines(lines):
 
 def section_lines(body, start, end=None):
     lines = [
-        clean(x)
-        for x in body.splitlines()
-        if clean(x)
+        clean(line)
+        for line in body.splitlines()
+        if clean(line)
     ]
 
     result = []
@@ -523,7 +490,7 @@ def patch_fields(body):
 
     maintenance = re.search(
         r"維護日期及時間\s*[:：]\s*([^\n]+)",
-        body
+        body,
     )
 
     if maintenance:
@@ -531,28 +498,24 @@ def patch_fields(body):
             "name": "🕒 維護時間",
             "value": shorten(
                 clean(maintenance.group(1)),
-                180
+                180,
             ),
             "inline": False,
         })
 
-    main_lines = section_lines(
-        body,
-        r"本次更新主要內容",
-        r"注意事項"
-    )
-
-    note_lines = section_lines(
-        body,
-        r"注意事項"
-    )
-
     main_items = combine_numbered_lines(
-        main_lines
+        section_lines(
+            body,
+            r"本次更新主要內容",
+            r"注意事項",
+        )
     )
 
     note_items = combine_numbered_lines(
-        note_lines
+        section_lines(
+            body,
+            r"注意事項",
+        )
     )
 
     if main_items:
@@ -560,7 +523,7 @@ def patch_fields(body):
             "name": "✨ 主要更新",
             "value": shorten(
                 "\n".join(main_items),
-                1000
+                1000,
             ),
             "inline": False,
         })
@@ -570,7 +533,7 @@ def patch_fields(body):
             "name": "⚠️ 注意事項／下架提醒",
             "value": shorten(
                 "\n".join(note_items),
-                1000
+                1000,
             ),
             "inline": False,
         })
@@ -580,7 +543,7 @@ def patch_fields(body):
             "name": "更新內容",
             "value": shorten(
                 body or "請查看官方公告",
-                1000
+                1000,
             ),
             "inline": False,
         })
@@ -595,18 +558,18 @@ def patch_fields(body):
 def make_embed(item, changed=False):
     category = item["category"]
 
-    title_prefix = (
-        "🔄 公告更新｜"
+    prefix = (
+        "🔄 公告內容更新｜"
         if changed else ""
     )
 
     embed = {
         "title": shorten(
-            LABELS[category]
+            prefix
+            + LABELS[category]
             + "｜"
-            + title_prefix
             + item["title"],
-            250
+            250,
         ),
         "url": item["url"],
         "description": (
@@ -622,8 +585,7 @@ def make_embed(item, changed=False):
         embed["fields"] = [{
             "name": "📋 活動詳情",
             "value": (
-                "點擊上方公告標題，"
-                "查看官方完整活動內容。"
+                "點擊上方標題查看官方完整活動。"
             ),
             "inline": False,
         }]
@@ -640,9 +602,9 @@ def make_embed(item, changed=False):
 
     elif category == "news":
         lines = [
-            clean(x)
-            for x in item["body"].splitlines()
-            if clean(x)
+            clean(line)
+            for line in item["body"].splitlines()
+            if clean(line)
         ]
 
         excerpt = "\n".join(lines[:12])
@@ -651,7 +613,7 @@ def make_embed(item, changed=False):
             "name": "📢 公告內容（節錄）",
             "value": shorten(
                 excerpt or "請查看官方公告",
-                1000
+                1000,
             ),
             "inline": False,
         }]
@@ -665,8 +627,8 @@ def send_discord(payload):
             "DRY RUN:",
             json.dumps(
                 payload,
-                ensure_ascii=False
-            )[:2000]
+                ensure_ascii=False,
+            )[:2500],
         )
         return
 
@@ -678,11 +640,11 @@ def send_discord(payload):
     response = SESSION.post(
         WEBHOOK,
         json=payload,
-        timeout=30
+        timeout=30,
     )
 
     if not response.ok:
-        # 不輸出 Webhook URL。
+        # 不輸出 Webhook URL 或 Secret。
         raise RuntimeError(
             "Discord HTTP "
             + str(response.status_code)
@@ -718,7 +680,7 @@ def notify(item, changed=False):
 
 
 # =====================================
-# 防止重複通知
+# 公告紀錄
 # =====================================
 
 def load_state():
@@ -732,17 +694,17 @@ def load_state():
             )
         )
 
-        return (
-            data
-            if isinstance(data, dict)
-            else {}
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(
+            "Cannot read official_news_state.json"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "Invalid announcement state"
         )
 
-    except (ValueError, OSError):
-        raise RuntimeError(
-            "Cannot read announcement state. "
-            "Please check official_news_state.json."
-        )
+    return data
 
 
 def save_state(state):
@@ -753,9 +715,10 @@ def save_state(state):
         json.dumps(
             state,
             ensure_ascii=False,
-            indent=2
+            indent=2,
+            sort_keys=True,
         ) + "\n",
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
 
@@ -764,15 +727,15 @@ def save_state(state):
 # =====================================
 
 def main():
-    print("Gabu 2.2 starting")
+    print("Gabu 2.3 starting")
     print("DRY_RUN:", DRY_RUN)
 
     if TEST:
         send_discord({
             "username": "加布",
             "content": (
-                "🧪 加布 2.2 "
-                "Discord 通知測試成功！"
+                "🧪 加布 2.3 測試成功！"
+                "\n官方公告通知功能已準備就緒。"
             ),
             "allowed_mentions": {
                 "parse": []
@@ -780,19 +743,10 @@ def main():
         })
         return
 
-    old = load_state()
-
-    migrating = (
-        old.get("_schema_version")
-        != STATE_VERSION
-    )
-
-    state = (
-        {"_schema_version": STATE_VERSION}
-        if migrating
-        else dict(old)
-    )
-
+    # 先讀取三類公告。
+    # 只要有任何一類解析失敗，
+    # 就不發送、不初始化、不覆蓋紀錄。
+    all_items = {}
     errors = []
 
     for category, url in SOURCES.items():
@@ -800,7 +754,7 @@ def main():
         print(
             "==========",
             category.upper(),
-            "=========="
+            "==========",
         )
 
         try:
@@ -828,7 +782,7 @@ def main():
                     "PREVIEW:",
                     item["date"],
                     "|",
-                    item["title"]
+                    item["title"],
                 )
 
                 print(
@@ -843,88 +797,23 @@ def main():
                         print(
                             "FIELD:",
                             field["name"],
-                            field["value"][:500]
+                            field["value"][:500],
                         )
 
-                if category == "news":
+                elif category == "news":
                     print(
                         "BODY:",
                         item["body"][:300]
                     )
 
-            if DRY_RUN:
-                print(
-                    "Dry run: no messages sent"
-                )
-                continue
-
-            prefix = category + ":"
-
-            existing_keys = [
-                key for key in old
-                if key.startswith(prefix)
-            ]
-
-            # 升級或首次啟動時：
-            # 只記錄目前公告，不發送舊消息。
-            if migrating or not existing_keys:
-                for item in items:
-                    state[
-                        prefix + item["key"]
-                    ] = item_digest(item)
-
-                save_state(state)
-
-                print(
-                    f"{category}: initialized; "
-                    "no historical notifications"
-                )
-                continue
-
-            pending = []
-
-            # 官網最新公告通常排在最前。
-            # 發送時由舊至新。
-            for item in reversed(items):
-                key = prefix + item["key"]
-                digest = item_digest(item)
-
-                if key not in old:
-                    pending.append(
-                        (item, False)
-                    )
-
-                elif old[key] != digest:
-                    pending.append(
-                        (item, True)
-                    )
-
-            # 每次最多發送八則。
-            for item, changed in pending[-8:]:
-                if category == "event":
-                    item = enrich_event(item)
-
-                notify(item, changed)
-
-                state[
-                    prefix + item["key"]
-                ] = item_digest(item)
-
-                save_state(state)
-
-                time.sleep(1)
-
-            print(
-                f"{category}: "
-                f"{len(pending)} pending changes"
-            )
+            all_items[category] = items
 
         except Exception as exc:
             print(
                 "ERROR:",
                 category,
                 type(exc).__name__,
-                str(exc)
+                str(exc),
             )
 
             errors.append(category)
@@ -932,14 +821,128 @@ def main():
     if errors:
         print(
             "Failed categories:",
-            ", ".join(errors)
+            ", ".join(errors),
+        )
+        sys.exit(1)
+
+    if DRY_RUN:
+        print()
+        print(
+            "DRY RUN completed: "
+            "no Discord messages or state changes"
+        )
+        return
+
+    old = load_state()
+
+    # 升級到 v4 時，所有現有公告
+    # 都只會建立基準，不會發送。
+    if old.get("_schema_version") != STATE_VERSION:
+        state = {
+            "_schema_version": STATE_VERSION
+        }
+
+        for category, items in all_items.items():
+            for item in items:
+                key = category + ":" + item["key"]
+                state[key] = item_digest(item)
+
+            print(
+                f"{category}: initialized "
+                f"{len(items)} entries; "
+                "no historical notifications"
+            )
+
+        save_state(state)
+
+        print(
+            "Initial baseline saved successfully"
+        )
+        return
+
+    state = dict(old)
+
+    for category, items in all_items.items():
+        prefix = category + ":"
+
+        existing = [
+            key for key in state
+            if key.startswith(prefix)
+        ]
+
+        # 防止某類公告的紀錄意外遺失
+        # 時，把所有歷史公告重新發送。
+        if not existing:
+            for item in items:
+                key = prefix + item["key"]
+                state[key] = item_digest(item)
+
+            save_state(state)
+
+            print(
+                f"{category}: baseline restored; "
+                "no historical notifications"
+            )
+            continue
+
+        pending = []
+
+        # 網站最新公告排在最前。
+        # 發送時按舊至新的次序。
+        for item in reversed(items):
+            key = prefix + item["key"]
+            digest = item_digest(item)
+
+            if key not in state:
+                pending.append(
+                    (item, False)
+                )
+
+            elif state[key] != digest:
+                pending.append(
+                    (item, True)
+                )
+
+        if not pending:
+            print(
+                f"{category}: no changes"
+            )
+            continue
+
+        # 如果一次發現超過 8 則，
+        # 先保留較早的待發公告，
+        # 每次最多發送 8 則。
+        batch = pending[:8]
+
+        for item, changed in batch:
+            if category == "event":
+                item = enrich_event(item)
+
+            # 只有 Discord 成功接收，
+            # 才更新這一則公告的紀錄。
+            notify(item, changed)
+
+            key = prefix + item["key"]
+            state[key] = item_digest(item)
+
+            save_state(state)
+            time.sleep(1)
+
+        print(
+            f"{category}: sent "
+            f"{len(batch)} notifications"
         )
 
-        sys.exit(1)
+        if len(pending) > len(batch):
+            print(
+                f"{category}: "
+                f"{len(pending) - len(batch)} "
+                "changes remaining"
+            )
 
     print()
     print(
-        "Gabu 2.2 completed successfully"
+        "Gabu 2.3 completed successfully"
     )
 
 
