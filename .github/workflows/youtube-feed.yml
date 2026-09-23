@@ -76,7 +76,7 @@ jobs:
                   )
 
               payload = {
-                  "username": "HKfuntown Feed",
+                  "username": "加布",
 
                   "embeds": [
                       {
