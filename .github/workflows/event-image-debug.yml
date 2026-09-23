@@ -1,0 +1,108 @@
+
+name: Gabu Event Image Debug
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4
+
+      - name: Check event images
+        run: |
+          python - <<'PY'
+          import requests
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin
+
+          PAGE = (
+              "https://www.talesrunner.com.hk/"
+              "event/202609LuckyTreasureAdventure/"
+          )
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0",
+          })
+
+          response = session.get(PAGE, timeout=30)
+          print("EVENT PAGE:", response.status_code)
+          response.raise_for_status()
+
+          soup = BeautifulSoup(
+              response.content, "html.parser"
+          )
+
+          images = soup.find_all("img")
+          print("IMAGE TAGS:", len(images))
+
+          checked = set()
+
+          for img in images:
+              raw = (
+                  img.get("data-original")
+                  or img.get("data-src")
+                  or img.get("src")
+              )
+
+              if not raw:
+                  continue
+
+              # 分別測試舊版與正確的相對網址。
+              old_url = urljoin(
+                  "https://www.talesrunner.com.hk",
+                  raw
+              )
+              page_url = urljoin(PAGE, raw)
+
+              if page_url in checked:
+                  continue
+
+              checked.add(page_url)
+
+              print("\nIMAGE:", raw[:180])
+              print("OLD URL:", old_url)
+              print("PAGE URL:", page_url)
+
+              for label, url in (
+                  ("OLD", old_url),
+                  ("PAGE", page_url),
+              ):
+                  try:
+                      result = session.get(
+                          url,
+                          headers={"Referer": PAGE},
+                          timeout=15,
+                          stream=True,
+                      )
+
+                      print(
+                          label,
+                          "STATUS:",
+                          result.status_code,
+                          "TYPE:",
+                          result.headers.get(
+                              "Content-Type", ""
+                          ),
+                      )
+                      result.close()
+
+                  except requests.RequestException as exc:
+                      print(
+                          label,
+                          "ERROR:",
+                          type(exc).__name__,
+                      )
+
+              if len(checked) >= 10:
+                  break
+          PY
