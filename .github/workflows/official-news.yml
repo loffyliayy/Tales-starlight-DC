@@ -2,6 +2,10 @@
 name: Gabu Official News
 
 on:
+  schedule:
+    # 每 20 分鐘檢查一次（UTC）
+    - cron: "7,27,47 * * * *"
+
   workflow_dispatch:
     inputs:
       test_notification:
@@ -46,13 +50,13 @@ jobs:
       - name: Check official announcements
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          TEST_NOTIFICATION: ${{ inputs.test_notification && 'true' || 'false' }}
-          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          TEST_NOTIFICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.test_notification && 'true' || 'false' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
         run: |
           python scripts/official_news.py
 
       - name: Save announcement state
-        if: ${{ always() && !inputs.dry_run && !inputs.test_notification }}
+        if: ${{ always() && (github.event_name == 'schedule' || (!inputs.dry_run && !inputs.test_notification)) }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
