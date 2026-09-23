@@ -1,0 +1,149 @@
+
+name: Gabu YouTube Preview
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Send latest HKfuntown video to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime
+
+          CHANNEL_ID = "UCRG7LdWB_-_fP7VF7nCPjcg"
+          RSS_URL = (
+              "https://www.youtube.com/feeds/videos.xml"
+              f"?channel_id={CHANNEL_ID}"
+          )
+
+          webhook = os.environ.get(
+              "DISCORD_WEBHOOK_URL", ""
+          ).strip()
+
+          if not webhook:
+              raise RuntimeError(
+                  "Missing DISCORD_WEBHOOK_URL"
+              )
+
+          # 讀取 YouTube 官方 RSS。
+          request = urllib.request.Request(
+              RSS_URL,
+              headers={
+                  "User-Agent": "Mozilla/5.0"
+              },
+          )
+
+          with urllib.request.urlopen(
+              request, timeout=30
+          ) as response:
+              xml_data = response.read()
+
+          root = ET.fromstring(xml_data)
+
+          ns = {
+              "atom": (
+                  "http://www.w3.org/2005/Atom"
+              ),
+              "yt": (
+                  "http://www.youtube.com/xml/schemas/2015"
+              ),
+          }
+
+          entries = root.findall(
+              "atom:entry", ns
+          )
+
+          if not entries:
+              raise RuntimeError(
+                  "YouTube RSS has no videos"
+              )
+
+          # RSS 第一筆通常是最新影片。
+          latest = entries[0]
+
+          title = latest.findtext(
+              "atom:title",
+              default="最新影片",
+              namespaces=ns,
+          )
+
+          video_id = latest.findtext(
+              "yt:videoId",
+              default="",
+              namespaces=ns,
+          )
+
+          published = latest.findtext(
+              "atom:published",
+              default="",
+              namespaces=ns,
+          )
+
+          if not video_id:
+              raise RuntimeError(
+                  "Missing YouTube video ID"
+              )
+
+          video_url = (
+              "https://www.youtube.com/watch?v="
+              + video_id
+          )
+
+          date_text = published[:10]
+
+          payload = {
+              "username": "加布",
+              "content": (
+                  "🧪 **YouTube 最新影片預覽**\n"
+                  "🎬 **" + title + "**\n"
+                  "📅 發布日期：" + date_text + "\n\n"
+                  + video_url
+              ),
+              "allowed_mentions": {
+                  "parse": []
+              },
+          }
+
+          data = json.dumps(
+              payload,
+              ensure_ascii=False,
+          ).encode("utf-8")
+
+          post = urllib.request.Request(
+              webhook,
+              data=data,
+              headers={
+                  "Content-Type": "application/json"
+              },
+              method="POST",
+          )
+
+          with urllib.request.urlopen(
+              post, timeout=30
+          ) as response:
+              print(
+                  "Discord HTTP:",
+                  response.status
+              )
+
+          print("Latest video:", title)
+          print("Published:", published)
+          print("Video:", video_url)
+          print(
+              "YouTube preview sent successfully"
+          )
+          PY
