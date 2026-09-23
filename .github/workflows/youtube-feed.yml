@@ -1,285 +1,217 @@
+
 name: HKfuntown YouTube Feed
 
 on:
   schedule:
-    # 每 10 分鐘檢查一次
     - cron: "*/10 * * * *"
-
-  # 允許你手動按 Run workflow 測試
   workflow_dispatch:
+    inputs:
+      test_notification:
+        description: "Send a test notification to Discord"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+concurrency:
+  group: youtube-feed
+  cancel-in-progress: false
 
 jobs:
   check-youtube:
     runs-on: ubuntu-latest
 
     steps:
-      # 取得 repository 內容
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
-      # 檢查 YouTube
-      - name: Check HKfuntown YouTube
+      - name: Check YouTube RSS and notify Discord
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TEST_NOTIFICATION: ${{ inputs.test_notification || 'false' }}
         run: |
           python <<'PY'
+          import os
+          import json
           import urllib.request
           import xml.etree.ElementTree as ET
-          import json
-          import os
-          import sys
 
-          # ==========================================
-          # HKfuntown YouTube RSS
-          # ==========================================
-
-          CHANNEL_URL = "https://www.youtube.com/@HKfuntown/videos"
-
-          print("正在取得 HKfuntown 頻道資訊...")
-
-          # 先取得頻道頁面
-          request = urllib.request.Request(
-              CHANNEL_URL,
-              headers={
-                  "User-Agent": "Mozilla/5.0"
-              }
-          )
-
-          response = urllib.request.urlopen(request)
-          html = response.read().decode("utf-8")
-
-          # 找 YouTube Channel ID
-          marker = '"channelId":"'
-          start = html.find(marker)
-
-          if start == -1:
-              print("找不到 YouTube Channel ID")
-              sys.exit(1)
-
-          start += len(marker)
-          end = html.find('"', start)
-
-          channel_id = html[start:end]
-
-          print("Channel ID:", channel_id)
-
-          # ==========================================
-          # YouTube RSS
-          # ==========================================
-
-          rss_url = (
+          CHANNEL_ID = "UCRG7LdWB_-_fP7VF7nCPjcg"
+          RSS_URL = (
               "https://www.youtube.com/feeds/videos.xml"
-              "?channel_id=" + channel_id
+              f"?channel_id={CHANNEL_ID}"
           )
+          STATE_FILE = "last_video.txt"
 
-          print("RSS:", rss_url)
+          webhook = os.environ.get("DISCORD_WEBHOOK_URL")
+          if not webhook:
+              raise RuntimeError(
+                  "Missing DISCORD_WEBHOOK_URL secret"
+              )
 
-          rss_request = urllib.request.Request(
-              rss_url,
+          def send_discord(title, url, test=False):
+              description = (
+                  "Webhook 測試成功！"
+                  if test else
+                  "HKfuntown 發布新影片！"
+              )
+
+              payload = {
+                  "username": "HKfuntown Feed",
+                  "embeds": [{
+                      "title": title,
+                      "description": description,
+                      "url": url,
+                      "color": 3447003,
+                      "footer": {
+                          "text": "HKfuntown YouTube Feed"
+                      }
+                  }]
+              }
+
+              request = urllib.request.Request(
+                  webhook,
+                  data=json.dumps(
+                      payload,
+                      ensure_ascii=False
+                  ).encode("utf-8"),
+                  headers={
+                      "Content-Type": "application/json"
+                  },
+                  method="POST"
+              )
+
+              with urllib.request.urlopen(
+                  request, timeout=30
+              ) as response:
+                  print(
+                      "Discord status:",
+                      response.status
+                  )
+
+          print("Checking HKfuntown RSS...")
+
+          request = urllib.request.Request(
+              RSS_URL,
               headers={
                   "User-Agent": "Mozilla/5.0"
               }
           )
 
-          rss_response = urllib.request.urlopen(rss_request)
-          rss_data = rss_response.read()
+          with urllib.request.urlopen(
+              request, timeout=30
+          ) as response:
+              rss_data = response.read()
 
           root = ET.fromstring(rss_data)
 
-          namespaces = {
+          ns = {
               "atom": "http://www.w3.org/2005/Atom",
               "yt": "http://www.youtube.com/xml/schemas/2015"
           }
 
-          entries = root.findall(
-              "atom:entry",
-              namespaces
-          )
+          entries = root.findall("atom:entry", ns)
 
           if not entries:
-              print("找不到影片")
-              sys.exit(0)
+              raise RuntimeError(
+                  "RSS returned no videos"
+              )
 
-          # RSS 第一筆就是最新影片
+          # Sort videos by publication date
+          entries.sort(
+              key=lambda e: e.findtext(
+                  "atom:published",
+                  default="",
+                  namespaces=ns
+              ),
+              reverse=True
+          )
+
           latest = entries[0]
 
-          video_id = latest.find(
-              "yt:videoId",
-              namespaces
-          ).text
+          video_id = latest.findtext(
+              "yt:videoId", namespaces=ns
+          )
 
-          title = latest.find(
-              "atom:title",
-              namespaces
-          ).text
+          title = latest.findtext(
+              "atom:title", namespaces=ns
+          )
 
-          published = latest.find(
-              "atom:published",
-              namespaces
-          ).text
+          if not video_id:
+              raise RuntimeError(
+                  "RSS returned no video ID"
+              )
 
           video_url = (
               "https://www.youtube.com/watch?v="
               + video_id
           )
 
-          print("")
-          print("最新影片：")
-          print(title)
-          print(video_url)
-          print(published)
+          print("Latest video:", title)
+          print("Video ID:", video_id)
 
-          # ==========================================
-          # 記錄上一支影片
-          # ==========================================
+          # Optional Discord test
+          if os.environ.get(
+              "TEST_NOTIFICATION", "false"
+          ).lower() == "true":
+              send_discord(
+                  "Discord 通知測試成功",
+                  video_url,
+                  test=True
+              )
 
-          state_file = "last_video.txt"
+          previous_id = ""
 
-          previous_video = ""
-
-          if os.path.exists(state_file):
+          if os.path.exists(STATE_FILE):
               with open(
-                  state_file,
-                  "r",
+                  STATE_FILE,
                   encoding="utf-8"
               ) as f:
-                  previous_video = f.read().strip()
+                  previous_id = f.read().strip()
 
-          # 第一次執行
-          if not previous_video:
+          # First run: save latest video
+          # without sending an old notification
+          if not previous_id:
+              print("First run: initializing state")
 
-              print("")
-              print("第一次執行。")
-              print("記錄目前影片，不發 Discord 通知。")
+          elif previous_id == video_id:
+              print("No new video")
+              raise SystemExit(0)
 
-              with open(
-                  state_file,
-                  "w",
-                  encoding="utf-8"
-              ) as f:
-                  f.write(video_id)
+          else:
+              print("New video detected!")
 
-              sys.exit(0)
+              send_discord(
+                  "🎬 " + title,
+                  video_url
+              )
 
-          # ==========================================
-          # 沒有新影片
-          # ==========================================
+              print("Notification sent")
 
-          if previous_video == video_id:
-
-              print("")
-              print("沒有新影片。")
-
-              sys.exit(0)
-
-          # ==========================================
-          # 發現新影片
-          # ==========================================
-
-          print("")
-          print("🎬 發現 HKfuntown 新影片！")
-
-          payload = {
-              "username": "HKfuntown Feed",
-
-              "embeds": [
-                  {
-                      "title": "🎬 HKfuntown 發布新影片！",
-
-                      "description": title,
-
-                      "url": video_url,
-
-                      "color": 16711680,
-
-                      "thumbnail": {
-                          "url": (
-                              "https://i.ytimg.com/vi/"
-                              + video_id
-                              + "/hqdefault.jpg"
-                          )
-                      },
-
-                      "fields": [
-                          {
-                              "name": "📺 Channel",
-                              "value": "HKfuntown",
-                              "inline": True
-                          },
-
-                          {
-                              "name": "📅 Published",
-                              "value": published,
-                              "inline": True
-                          }
-                      ],
-
-                      "footer": {
-                          "text": "HKfuntown YouTube Feed"
-                      }
-                  }
-              ]
-          }
-
-          data = json.dumps(
-              payload,
-              ensure_ascii=False
-          ).encode("utf-8")
-
-          # ==========================================
-          # Discord Webhook
-          # ==========================================
-
-          discord_request = urllib.request.Request(
-              os.environ["DISCORD_WEBHOOK_URL"],
-              data=data,
-
-              headers={
-                  "Content-Type": "application/json"
-              },
-
-              method="POST"
-          )
-
-          discord_response = urllib.request.urlopen(
-              discord_request
-          )
-
-          print("")
-          print(
-              "Discord 回應：",
-              discord_response.status
-          )
-
-          # ==========================================
-          # 更新影片紀錄
-          # ==========================================
-
+          # Save state only after successful delivery
           with open(
-              state_file,
+              STATE_FILE,
               "w",
               encoding="utf-8"
           ) as f:
-              f.write(video_id)
+              f.write(video_id + "\n")
 
-          print("已更新 last_video.txt")
-
+          print("State updated")
           PY
 
-      # 把最新影片紀錄存回 GitHub
-      - name: Save latest video
+      - name: Save latest video state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add last_video.txt
 
-          if git diff --cached --quiet; then
-            echo "沒有需要 commit 的變更"
-          else
+          if ! git diff --cached --quiet; then
             git commit -m "Update latest HKfuntown video"
             git push
+          else
+            echo "No state changes"
           fi
