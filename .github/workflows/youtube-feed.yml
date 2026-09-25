@@ -49,12 +49,10 @@ jobs:
 
           CHANNEL_ID = "UCRG7LdWB_-_fP7VF7nCPjcg"
           CHANNEL_URL = "https://www.youtube.com/@HKfuntown/videos"
-
           RSS_URL = (
               "https://www.youtube.com/feeds/videos.xml"
               f"?channel_id={CHANNEL_ID}"
           )
-
           STATE_FILE = "last_video.txt"
 
           webhook = os.environ.get(
@@ -71,31 +69,30 @@ jobs:
                   "Missing DISCORD_WEBHOOK_URL secret"
               )
 
-          # ====================================
-          # Discord notification
-          # ====================================
-
           def send_discord(title, video_url, test=False):
-              description = (
-                  "Webhook 測試成功！"
-                  if test
-                  else "HKfuntown 發布新影片！"
-              )
-
-              payload = {
-                  "username": "加布",
-                  "embeds": [
-                      {
-                          "title": title,
-                          "description": description,
-                          "url": video_url,
+              if test:
+                  payload = {
+                      "username": "加布",
+                      "embeds": [{
+                          "title": "Discord 通知測試成功",
+                          "description": "Webhook 測試成功！",
                           "color": 3447003,
                           "footer": {
                               "text": "HKfuntown YouTube Feed"
                           }
-                      }
-                  ]
-              }
+                      }]
+                  }
+              else:
+                  # Put the bare YouTube URL in content.
+                  # Discord can generate its native player.
+                  payload = {
+                      "username": "加布",
+                      "content": (
+                          "🎬 **HKfuntown 發布新影片！**\n"
+                          f"**{title}**\n\n"
+                          f"{video_url}"
+                      )
+                  }
 
               data = json.dumps(
                   payload,
@@ -107,7 +104,7 @@ jobs:
                   data=data,
                   headers={
                       "Content-Type": "application/json",
-                      "User-Agent": "GabuYouTubeFeed/2.7"
+                      "User-Agent": "GabuYouTubeFeed/2.8"
                   },
                   method="POST"
               )
@@ -121,20 +118,14 @@ jobs:
                           "Discord HTTP status:",
                           response.status
                       )
-
               except urllib.error.HTTPError as error:
                   print(
                       "Discord HTTP status:",
                       error.code
                   )
-
                   raise RuntimeError(
                       "Discord notification failed"
                   ) from None
-
-          # ====================================
-          # Method 1: YouTube RSS
-          # ====================================
 
           def fetch_rss():
               namespaces = {
@@ -159,9 +150,7 @@ jobs:
               }
 
               for attempt in range(1, 4):
-                  print(
-                      f"RSS attempt {attempt}/3"
-                  )
+                  print(f"RSS attempt {attempt}/3")
 
                   try:
                       request = urllib.request.Request(
@@ -176,7 +165,6 @@ jobs:
                           rss_data = response.read()
 
                       root = ET.fromstring(rss_data)
-
                       entries = root.findall(
                           "atom:entry",
                           namespaces
@@ -188,12 +176,10 @@ jobs:
                           )
 
                       entries.sort(
-                          key=lambda entry: (
-                              entry.findtext(
-                                  "atom:published",
-                                  default="",
-                                  namespaces=namespaces
-                              )
+                          key=lambda entry: entry.findtext(
+                              "atom:published",
+                              default="",
+                              namespaces=namespaces
                           ),
                           reverse=True
                       )
@@ -216,9 +202,7 @@ jobs:
                               "RSS video ID missing"
                           )
 
-                      print(
-                          "RSS successfully loaded"
-                      )
+                      print("RSS successfully loaded")
 
                       return {
                           "id": video_id,
@@ -245,10 +229,6 @@ jobs:
                           time.sleep(5)
 
               return None
-
-          # ====================================
-          # Method 2: Backup reader
-          # ====================================
 
           def fetch_backup():
               print(
@@ -294,10 +274,7 @@ jobs:
                       )
                       return None
 
-                  # Channel /videos is normally
-                  # returned newest first.
                   latest = entries[0]
-
                   video_id = latest["id"]
 
                   print(
@@ -324,35 +301,39 @@ jobs:
                   )
                   return None
 
-          # ====================================
-          # Manual webhook test
-          # ====================================
-
+          # Manual test: send the latest video
+          # without changing last_video.txt.
           if test_mode:
-              print(
-                  "Sending Discord test notification"
-              )
+              print("Running notification preview")
 
-              send_discord(
-                  "Discord 通知測試成功",
-                  CHANNEL_URL,
-                  test=True
-              )
+              video = fetch_rss()
+
+              if video is None:
+                  video = fetch_backup()
+
+              if video is None:
+                  print(
+                      "YouTube unavailable. "
+                      "Testing Discord webhook only."
+                  )
+                  send_discord(
+                      "Discord 通知測試成功",
+                      CHANNEL_URL,
+                      test=True
+                  )
+              else:
+                  send_discord(
+                      video["title"],
+                      video["url"]
+                  )
 
               print(
-                  "Test complete. "
+                  "Preview complete. "
                   "Video state was not changed."
               )
-
               raise SystemExit(0)
 
-          # ====================================
-          # Fetch latest video
-          # ====================================
-
-          print(
-              "Checking HKfuntown YouTube..."
-          )
+          print("Checking HKfuntown YouTube...")
 
           video = fetch_rss()
 
@@ -364,15 +345,10 @@ jobs:
                   "WARNING: Both YouTube readers "
                   "are temporarily unavailable."
               )
-
               print(
-                  "Keeping previous video state."
-              )
-
-              print(
+                  "Keeping previous video state. "
                   "Next scheduled run will retry."
               )
-
               raise SystemExit(0)
 
           video_id = video["id"]
@@ -381,10 +357,6 @@ jobs:
 
           print("Latest video:", title)
           print("Video ID:", video_id)
-
-          # ====================================
-          # Read previous video
-          # ====================================
 
           previous_id = ""
 
@@ -396,10 +368,6 @@ jobs:
               ) as file:
                   previous_id = file.read().strip()
 
-          # ====================================
-          # Compare and notify
-          # ====================================
-
           if not previous_id:
               print(
                   "First run: initializing state "
@@ -410,22 +378,16 @@ jobs:
               print(
                   "No new video. Nothing to send."
               )
-
               raise SystemExit(0)
 
           else:
               print(
                   "New HKfuntown video detected!"
               )
-
               send_discord(
                   title,
                   video_url
               )
-
-          # ====================================
-          # Save state
-          # ====================================
 
           with open(
               STATE_FILE,
@@ -437,10 +399,10 @@ jobs:
           print(
               "Video state updated successfully"
           )
-
           PY
 
       - name: Save latest video state
+        if: ${{ !inputs.test_notification }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
