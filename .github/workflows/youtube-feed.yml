@@ -29,7 +29,11 @@ jobs:
         with:
           persist-credentials: true
 
-      - name: Check YouTube RSS and notify Discord
+      - name: Install backup YouTube reader
+        run: |
+          python -m pip install --upgrade yt-dlp
+
+      - name: Check YouTube and notify Discord
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TEST_NOTIFICATION: ${{ inputs.test_notification || 'false' }}
@@ -38,11 +42,13 @@ jobs:
           python <<'PY'
           import os
           import json
+          import time
           import urllib.request
           import urllib.error
           import xml.etree.ElementTree as ET
 
           CHANNEL_ID = "UCRG7LdWB_-_fP7VF7nCPjcg"
+          CHANNEL_URL = "https://www.youtube.com/@HKfuntown/videos"
 
           RSS_URL = (
               "https://www.youtube.com/feeds/videos.xml"
@@ -55,6 +61,11 @@ jobs:
               "DISCORD_WEBHOOK_URL", ""
           ).strip()
 
+          test_mode = (
+              os.environ.get("TEST_NOTIFICATION", "false")
+              .lower() == "true"
+          )
+
           if not webhook:
               raise RuntimeError(
                   "Missing DISCORD_WEBHOOK_URL secret"
@@ -65,19 +76,14 @@ jobs:
           # ====================================
 
           def send_discord(title, video_url, test=False):
-
-              if test:
-                  description = (
-                      "Webhook 測試成功！"
-                  )
-              else:
-                  description = (
-                      "HKfuntown 發布新影片！"
-                  )
+              description = (
+                  "Webhook 測試成功！"
+                  if test
+                  else "HKfuntown 發布新影片！"
+              )
 
               payload = {
                   "username": "加布",
-
                   "embeds": [
                       {
                           "title": title,
@@ -101,9 +107,7 @@ jobs:
                   data=data,
                   headers={
                       "Content-Type": "application/json",
-                      "User-Agent": (
-                          "HKfuntownFeed/1.0"
-                      )
+                      "User-Agent": "GabuYouTubeFeed/2.7"
                   },
                   method="POST"
               )
@@ -113,169 +117,296 @@ jobs:
                       request,
                       timeout=30
                   ) as response:
-
                       print(
                           "Discord HTTP status:",
                           response.status
                       )
 
-                      print(
-                          "Discord notification sent!"
-                      )
-
-              except urllib.error.HTTPError as e:
-
+              except urllib.error.HTTPError as error:
                   print(
                       "Discord HTTP status:",
-                      e.code
-                  )
-
-                  # Do not expose the webhook URL.
-                  # Display a limited response body.
-                  error_body = e.read(
-                      2000
-                  ).decode(
-                      "utf-8",
-                      errors="replace"
-                  )
-
-                  error_body = error_body.replace(
-                      webhook,
-                      "[REDACTED WEBHOOK]"
-                  )
-
-                  print(
-                      "Discord response:",
-                      error_body
+                      error.code
                   )
 
                   raise RuntimeError(
-                      f"Discord request failed: HTTP {e.code}"
+                      "Discord notification failed"
                   ) from None
 
           # ====================================
-          # Fetch YouTube RSS
+          # Method 1: YouTube RSS
           # ====================================
 
-          print("Checking HKfuntown RSS...")
-
-          rss_request = urllib.request.Request(
-              RSS_URL,
-              headers={
-                  "User-Agent": "Mozilla/5.0"
+          def fetch_rss():
+              namespaces = {
+                  "atom": "http://www.w3.org/2005/Atom",
+                  "yt": (
+                      "http://www.youtube.com/xml/"
+                      "schemas/2015"
+                  )
               }
-          )
 
-          with urllib.request.urlopen(
-              rss_request,
-              timeout=30
-          ) as response:
+              headers = {
+                  "User-Agent": (
+                      "Mozilla/5.0 "
+                      "(Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 "
+                      "Chrome/131.0 Safari/537.36"
+                  ),
+                  "Accept": (
+                      "application/atom+xml,"
+                      "application/xml,text/xml,*/*"
+                  )
+              }
 
-              rss_data = response.read()
+              for attempt in range(1, 4):
+                  print(
+                      f"RSS attempt {attempt}/3"
+                  )
 
-          root = ET.fromstring(rss_data)
+                  try:
+                      request = urllib.request.Request(
+                          RSS_URL,
+                          headers=headers
+                      )
 
-          namespaces = {
-              "atom": "http://www.w3.org/2005/Atom",
-              "yt": (
-                  "http://www.youtube.com/xml/"
-                  "schemas/2015"
+                      with urllib.request.urlopen(
+                          request,
+                          timeout=25
+                      ) as response:
+                          rss_data = response.read()
+
+                      root = ET.fromstring(rss_data)
+
+                      entries = root.findall(
+                          "atom:entry",
+                          namespaces
+                      )
+
+                      if not entries:
+                          raise ValueError(
+                              "RSS contains no videos"
+                          )
+
+                      entries.sort(
+                          key=lambda entry: (
+                              entry.findtext(
+                                  "atom:published",
+                                  default="",
+                                  namespaces=namespaces
+                              )
+                          ),
+                          reverse=True
+                      )
+
+                      latest = entries[0]
+
+                      video_id = latest.findtext(
+                          "yt:videoId",
+                          namespaces=namespaces
+                      )
+
+                      title = latest.findtext(
+                          "atom:title",
+                          default="HKfuntown 新影片",
+                          namespaces=namespaces
+                      )
+
+                      if not video_id:
+                          raise ValueError(
+                              "RSS video ID missing"
+                          )
+
+                      print(
+                          "RSS successfully loaded"
+                      )
+
+                      return {
+                          "id": video_id,
+                          "title": title,
+                          "url": (
+                              "https://www.youtube.com/"
+                              "watch?v=" + video_id
+                          )
+                      }
+
+                  except (
+                      urllib.error.URLError,
+                      TimeoutError,
+                      ValueError,
+                      ET.ParseError
+                  ) as error:
+                      print(
+                          "RSS unavailable:",
+                          type(error).__name__,
+                          str(error)[:200]
+                      )
+
+                      if attempt < 3:
+                          time.sleep(5)
+
+              return None
+
+          # ====================================
+          # Method 2: Backup reader
+          # ====================================
+
+          def fetch_backup():
+              print(
+                  "Trying backup YouTube reader..."
               )
-          }
 
-          entries = root.findall(
-              "atom:entry",
-              namespaces
-          )
+              try:
+                  import yt_dlp
 
-          if not entries:
-              raise RuntimeError(
-                  "No videos found in YouTube RSS"
+                  options = {
+                      "quiet": True,
+                      "no_warnings": True,
+                      "extract_flat": True,
+                      "playlistend": 5,
+                      "skip_download": True,
+                      "socket_timeout": 25,
+                      "retries": 2,
+                      "ignoreerrors": True
+                  }
+
+                  with yt_dlp.YoutubeDL(
+                      options
+                  ) as youtube:
+                      result = youtube.extract_info(
+                          CHANNEL_URL,
+                          download=False
+                      )
+
+                  if not result:
+                      return None
+
+                  entries = [
+                      item
+                      for item in result.get(
+                          "entries", []
+                      )
+                      if item and item.get("id")
+                  ]
+
+                  if not entries:
+                      print(
+                          "Backup returned no videos"
+                      )
+                      return None
+
+                  # Channel /videos is normally
+                  # returned newest first.
+                  latest = entries[0]
+
+                  video_id = latest["id"]
+
+                  print(
+                      "Backup reader succeeded"
+                  )
+
+                  return {
+                      "id": video_id,
+                      "title": latest.get(
+                          "title",
+                          "HKfuntown 新影片"
+                      ),
+                      "url": (
+                          "https://www.youtube.com/"
+                          "watch?v=" + video_id
+                      )
+                  }
+
+              except Exception as error:
+                  print(
+                      "Backup reader unavailable:",
+                      type(error).__name__,
+                      str(error)[:200]
+                  )
+                  return None
+
+          # ====================================
+          # Manual webhook test
+          # ====================================
+
+          if test_mode:
+              print(
+                  "Sending Discord test notification"
               )
 
-          # Sort by publication date.
-          entries.sort(
-              key=lambda entry: entry.findtext(
-                  "atom:published",
-                  default="",
-                  namespaces=namespaces
-              ),
-              reverse=True
-          )
-
-          latest = entries[0]
-
-          video_id = latest.findtext(
-              "yt:videoId",
-              namespaces=namespaces
-          )
-
-          title = latest.findtext(
-              "atom:title",
-              namespaces=namespaces
-          )
-
-          if not video_id:
-              raise RuntimeError(
-                  "Video ID not found"
+              send_discord(
+                  "Discord 通知測試成功",
+                  CHANNEL_URL,
+                  test=True
               )
 
-          video_url = (
-              "https://www.youtube.com/watch?v="
-              + video_id
+              print(
+                  "Test complete. "
+                  "Video state was not changed."
+              )
+
+              raise SystemExit(0)
+
+          # ====================================
+          # Fetch latest video
+          # ====================================
+
+          print(
+              "Checking HKfuntown YouTube..."
           )
+
+          video = fetch_rss()
+
+          if video is None:
+              video = fetch_backup()
+
+          if video is None:
+              print(
+                  "WARNING: Both YouTube readers "
+                  "are temporarily unavailable."
+              )
+
+              print(
+                  "Keeping previous video state."
+              )
+
+              print(
+                  "Next scheduled run will retry."
+              )
+
+              raise SystemExit(0)
+
+          video_id = video["id"]
+          title = video["title"]
+          video_url = video["url"]
 
           print("Latest video:", title)
           print("Video ID:", video_id)
 
           # ====================================
-          # Manual Discord test
-          # ====================================
-
-          test_mode = os.environ.get(
-              "TEST_NOTIFICATION",
-              "false"
-          ).lower() == "true"
-
-          if test_mode:
-
-              print(
-                  "Sending Discord test notification..."
-              )
-
-              send_discord(
-                  "Discord 通知測試成功",
-                  video_url,
-                  test=True
-              )
-
-          # ====================================
-          # Check previous video
+          # Read previous video
           # ====================================
 
           previous_id = ""
 
           if os.path.exists(STATE_FILE):
-
               with open(
                   STATE_FILE,
                   "r",
                   encoding="utf-8"
               ) as file:
-
                   previous_id = file.read().strip()
 
-          # First run:
-          # Save current video without notification.
+          # ====================================
+          # Compare and notify
+          # ====================================
 
           if not previous_id:
-
               print(
-                  "First run: initializing video state"
+                  "First run: initializing state "
+                  "without sending old video"
               )
 
           elif previous_id == video_id:
-
               print(
                   "No new video. Nothing to send."
               )
@@ -283,7 +414,6 @@ jobs:
               raise SystemExit(0)
 
           else:
-
               print(
                   "New HKfuntown video detected!"
               )
@@ -302,10 +432,7 @@ jobs:
               "w",
               encoding="utf-8"
           ) as file:
-
-              file.write(
-                  video_id + "\n"
-              )
+              file.write(video_id + "\n")
 
           print(
               "Video state updated successfully"
@@ -324,5 +451,6 @@ jobs:
             echo "No state changes"
           else
             git commit -m "Update latest HKfuntown video"
+            git pull --rebase
             git push
           fi
