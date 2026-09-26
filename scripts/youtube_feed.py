@@ -26,7 +26,8 @@ def timestamp(value):
 
 def parse_feed(data):
     root = ET.fromstring(data)
-    if root.findtext("yt:channelId", namespaces=NS) != CHANNEL_ID:
+    # YouTube Atom feeds can omit the UC prefix in yt:channelId.
+    if root.findtext("yt:channelId", namespaces=NS) not in (CHANNEL_ID, CHANNEL_ID[2:]):
         raise ValueError("Unexpected RSS channel")
     videos = {}
     for entry in root.findall("a:entry", NS):
@@ -114,8 +115,9 @@ def main():
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             videos = parse_feed(response.read())
-    except (urllib.error.URLError, TimeoutError, ValueError, ET.ParseError):
-        raise RuntimeError("YouTube RSS unavailable or invalid; no notification or state change. Retry next run.") from None
+    except (urllib.error.URLError, TimeoutError, ValueError, ET.ParseError) as error:
+        reason = f"HTTP {error.code}" if isinstance(error, urllib.error.HTTPError) else type(error).__name__
+        raise RuntimeError(f"YouTube RSS unavailable or invalid ({reason}); no notification or state change. Retry next run.") from None
     process(videos, state, datetime.now(timezone.utc), dry_run=not args.send)
 
 
