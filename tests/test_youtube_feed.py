@@ -81,6 +81,7 @@ class FeedTests(unittest.TestCase):
                + entry("new_video02", "2026-09-26T19:45:00+08:00")
                + entry("new_video01", "2026-09-26T11:30:00Z") * 2 + '</feed>')
         self.assertEqual([v["id"] for v in bot.parse_feed(xml)], ["new_video01", "new_video02"])
+        self.assertEqual(bot.parse_feed(xml.replace(bot.CHANNEL_ID, bot.CHANNEL_ID[2:])), bot.parse_feed(xml))
         for invalid in [xml.replace(bot.CHANNEL_ID, "other"), xml.replace("2026-09-26T11:30:00Z", "bad")]:
             with self.assertRaises(ValueError):
                 bot.parse_feed(invalid)
