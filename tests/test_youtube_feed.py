@@ -91,8 +91,7 @@ class FeedTests(unittest.TestCase):
              patch("sys.argv", ["youtube_feed.py"]), \
              patch.object(bot.urllib.request, "urlopen", side_effect=bot.urllib.error.URLError("offline")), \
              patch.object(bot, "process") as process:
-            with self.assertRaises(RuntimeError):
-                bot.main()
+            self.assertIsNone(bot.main())
             process.assert_not_called()
 
 
