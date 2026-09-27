@@ -117,7 +117,11 @@ def main():
             videos = parse_feed(response.read())
     except (urllib.error.URLError, TimeoutError, ValueError, ET.ParseError) as error:
         reason = f"HTTP {error.code}" if isinstance(error, urllib.error.HTTPError) else type(error).__name__
-        raise RuntimeError(f"YouTube RSS unavailable or invalid ({reason}); no notification or state change. Retry next run.") from None
+        # YouTube intermittently returns errors to GitHub-hosted runners. This
+        # is not a bot failure: keep the durable state unchanged and let the
+        # next schedule retry without generating GitHub failure emails.
+        print(f"YouTube RSS unavailable or invalid ({reason}); no notification or state change. Retry next run.")
+        return
     process(videos, state, datetime.now(timezone.utc), dry_run=not args.send)
 
 
