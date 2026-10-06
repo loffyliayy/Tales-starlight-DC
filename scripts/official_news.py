@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -53,6 +54,7 @@ NUMBER_RE = re.compile(r"^\d+\s*[)）.、]\s*")
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGES = 1
+MAX_NOTICE_AGE_DAYS = 14
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -145,6 +147,21 @@ def make_item(category, date, title, body="", url=""):
         "url": url or SOURCES[category],
         "key": item_key(category, date, title),
     }
+
+
+def is_recent_notice(item, now=None):
+    """Only publish current official notices, never refreshed archive pages."""
+    now = now or datetime.now(timezone.utc)
+
+    try:
+        published = datetime.strptime(
+            item["date"], "%Y/%m/%d"
+        ).replace(tzinfo=timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    age_days = (now.date() - published.date()).days
+    return 0 <= age_days <= MAX_NOTICE_AGE_DAYS
 
 
 # Event announcements
@@ -908,10 +925,11 @@ def main():
 
     if errors:
         print(
-            "Failed categories:",
+            "WARNING: unavailable categories; "
+            "keeping state and retrying next run:",
             ", ".join(errors),
         )
-        sys.exit(1)
+        return
 
     if DRY_RUN:
         print(
@@ -972,15 +990,32 @@ def main():
             continue
 
         pending = []
+        ignored_archives = 0
+        state_changed = False
 
         for item in reversed(items):
             key = prefix + item["key"]
             digest = item_digest(item)
 
+            if not is_recent_notice(item):
+                if state.get(key) != digest:
+                    state[key] = digest
+                    state_changed = True
+                ignored_archives += 1
+                continue
+
             if key not in state:
                 pending.append((item, False))
             elif state[key] != digest:
                 pending.append((item, True))
+
+        if state_changed:
+            save_state(state)
+            print(
+                f"{category}: recorded "
+                f"{ignored_archives} archived notices; "
+                "none were sent"
+            )
 
         if not pending:
             print(
